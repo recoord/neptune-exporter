@@ -51,6 +51,7 @@ class WandBLoader(DataLoader):
         self.name_prefix = name_prefix
         self._logger = logging.getLogger(__name__)
         self._active_run: Optional[wandb.Run] = None
+        self._current_run_name: Optional[str] = None
 
         # Authenticate with W&B
         if api_key:
@@ -61,16 +62,17 @@ class WandBLoader(DataLoader):
             os.environ["WANDB_SILENT"] = "true"
 
     def _sanitize_attribute_name(self, attribute_path: str) -> str:
-        """
-        Sanitize Neptune attribute path to W&B-compatible key.
+        """Sanitize Neptune attribute path to W&B-compatible metric/config key.
 
-        W&B key constraints:
-        - Must start with a letter or underscore
-        - Can only contain letters, numbers, and underscores
-        - Pattern: /^[_a-zA-Z][_a-zA-Z0-9]*$/
+        Preserves "/" separators since W&B uses them for hierarchical section
+        grouping in the UI (e.g. "training/val/loss" renders in a "training" section).
         """
-        # Replace invalid characters with underscores
-        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", attribute_path)
+        # Replace invalid characters with underscores, but preserve "/"
+        sanitized = re.sub(r"[^a-zA-Z0-9_/]", "_", attribute_path)
+
+        # Clean up slashes: strip leading/trailing, collapse doubles
+        sanitized = sanitized.strip("/")
+        sanitized = re.sub(r"/+", "/", sanitized)
 
         # Ensure it starts with a letter or underscore
         if sanitized and not sanitized[0].isalpha() and sanitized[0] != "_":
@@ -82,11 +84,42 @@ class WandBLoader(DataLoader):
 
         return sanitized
 
+    def _make_artifact_name(self, attribute_path: str, run_name: str, suffix: str = "") -> str:
+        """Create a W&B artifact name from Neptune attribute path and run name.
+
+        Artifact names cannot contain "/" so we use "__" to preserve hierarchy
+        while avoiding collisions (e.g. "foo/bar" -> "foo__bar", "foo-bar" stays).
+        Names are scoped per run to prevent cross-run collisions.
+        """
+        # Replace "/" with "__" to preserve hierarchy without collisions
+        sanitized = re.sub(r"/+", "__", attribute_path)
+        # Replace remaining invalid characters
+        sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "_", sanitized)
+        sanitized = sanitized.strip("_.-")
+
+        name = f"{sanitized}-{run_name}"
+        if suffix:
+            name = f"{name}-{suffix}"
+
+        # W&B artifact names have a 128-char limit
+        if len(name) > 128:
+            # Truncate the path part, keep run_name and suffix intact
+            tail = f"-{run_name}"
+            if suffix:
+                tail = f"-{run_name}-{suffix}"
+            max_path_len = 128 - len(tail)
+            name = f"{sanitized[:max_path_len]}{tail}"
+
+        return name
+
     def _get_project_name(self, project_id: str) -> str:
-        """Get W&B project name from Neptune project ID."""
-        # W&B uses entity/project structure
-        # Neptune project_id maps directly to W&B project
-        name = project_id
+        """Get W&B project name from Neptune project ID.
+
+        Strips the Neptune org prefix (e.g. "veo-ai/my-project" -> "my-project")
+        since the W&B entity (org) is passed separately via --wandb-entity.
+        """
+        # Strip Neptune org prefix — W&B entity is set separately
+        name = project_id.split("/")[-1] if "/" in project_id else project_id
 
         if self.name_prefix:
             name = f"{self.name_prefix}_{name}"
@@ -102,9 +135,7 @@ class WandBLoader(DataLoader):
             return 0
         return int(float(step) * step_multiplier)
 
-    def create_experiment(
-        self, project_id: str, experiment_name: str
-    ) -> TargetExperimentId:
+    def create_experiment(self, project_id: str, experiment_name: str) -> TargetExperimentId:
         """
         Neptune experiment_name maps to W&B group (set in create_run).
         We return the experiment name as the group name to use.
@@ -187,12 +218,8 @@ class WandBLoader(DataLoader):
                 # step_multiplier should always be provided when fork_step is set
                 if fork_step is not None:
                     if step_multiplier is None:
-                        raise ValueError(
-                            "step_multiplier must be provided when fork_step is set"
-                        )
-                    step_int = self._convert_step_to_int(
-                        Decimal(str(fork_step)), step_multiplier
-                    )
+                        raise ValueError("step_multiplier must be provided when fork_step is set")
+                    step_int = self._convert_step_to_int(Decimal(str(fork_step)), step_multiplier)
                 else:
                     step_int = 0
 
@@ -200,15 +227,14 @@ class WandBLoader(DataLoader):
                 # https://docs.wandb.ai/models/runs/forking
                 fork_from = f"{parent_run_id}?_step={step_int}"
                 init_kwargs["fork_from"] = fork_from
-                self._logger.info(
-                    f"Creating forked run '{run_name}' from parent {parent_run_id} at step {step_int}"
-                )
+                self._logger.info(f"Creating forked run '{run_name}' from parent {parent_run_id} at step {step_int}")
 
             # Initialize the run
             run = wandb.init(**init_kwargs)
             wandb_run_id = run.id
 
             self._active_run = run
+            self._current_run_name = run_name
 
             self._logger.info(f"Created run '{run_name}' with W&B ID {wandb_run_id}")
             return TargetRunId(wandb_run_id)
@@ -236,9 +262,7 @@ class WandBLoader(DataLoader):
             # Note: We assume the run is already active from create_run
             # If not, we would need to resume it
             if self._active_run is None or self._active_run.id != run_id:
-                self._logger.error(
-                    f"Run {run_id} is not active. Call create_run first."
-                )
+                self._logger.error(f"Run {run_id} is not active. Call create_run first.")
                 raise RuntimeError(f"Run {run_id} is not active")
 
             for run_data_part in run_data:
@@ -251,6 +275,7 @@ class WandBLoader(DataLoader):
             # Finish the run
             self._active_run.finish()
             self._active_run = None
+            self._current_run_name = None
 
             self._logger.info(f"Successfully uploaded run {run_id} to W&B")
 
@@ -259,6 +284,7 @@ class WandBLoader(DataLoader):
             if self._active_run:
                 self._active_run.finish(exit_code=1)
                 self._active_run = None
+                self._current_run_name = None
             raise
 
     def upload_parameters(self, run_data: pd.DataFrame, run_id: TargetRunId) -> None:
@@ -285,23 +311,16 @@ class WandBLoader(DataLoader):
                 config[attr_name] = row["string_value"]
             elif row["attribute_type"] == "bool" and pd.notna(row["bool_value"]):
                 config[attr_name] = bool(row["bool_value"])
-            elif row["attribute_type"] == "datetime" and pd.notna(
-                row["datetime_value"]
-            ):
+            elif row["attribute_type"] == "datetime" and pd.notna(row["datetime_value"]):
                 config[attr_name] = str(row["datetime_value"])
-            elif (
-                row["attribute_type"] == "string_set"
-                and row["string_set_value"] is not None
-            ):
+            elif row["attribute_type"] == "string_set" and row["string_set_value"] is not None:
                 config[attr_name] = list(row["string_set_value"])
 
         if config:
             self._active_run.config.update(config)
             self._logger.info(f"Uploaded {len(config)} parameters for run {run_id}")
 
-    def upload_metrics(
-        self, run_data: pd.DataFrame, run_id: TargetRunId, step_multiplier: int
-    ) -> None:
+    def upload_metrics(self, run_data: pd.DataFrame, run_id: TargetRunId, step_multiplier: int) -> None:
         """Upload metrics (float series) to W&B run.
 
         Args:
@@ -347,18 +366,16 @@ class WandBLoader(DataLoader):
         if self._active_run is None:
             raise RuntimeError("No active run")
 
+        run_name = self._current_run_name or run_id
+
         # Handle regular files
-        file_data = run_data[
-            run_data["attribute_type"].isin(["file", "file_set", "artifact"])
-        ]
+        file_data = run_data[run_data["attribute_type"].isin(["file", "file_set", "artifact"])]
         for _, row in file_data.iterrows():
             if pd.notna(row["file_value"]) and isinstance(row["file_value"], dict):
                 file_path = files_base_path / row["file_value"]["path"]
                 if file_path.exists():
-                    attr_name = self._sanitize_attribute_name(row["attribute_path"])
-                    artifact = wandb.Artifact(
-                        name=attr_name, type=row["attribute_type"]
-                    )
+                    artifact_name = self._make_artifact_name(row["attribute_path"], run_name)
+                    artifact = wandb.Artifact(name=artifact_name, type=row["attribute_type"])
                     if file_path.is_file():
                         artifact.add_file(str(file_path))
                     else:
@@ -370,21 +387,13 @@ class WandBLoader(DataLoader):
         # Handle file series
         file_series_data = run_data[run_data["attribute_type"] == "file_series"]
         for attr_path, group in file_series_data.groupby("attribute_path"):
-            attr_name = self._sanitize_attribute_name(attr_path)
-
             for _, row in group.iterrows():
                 if pd.notna(row["file_value"]) and isinstance(row["file_value"], dict):
                     file_path = files_base_path / row["file_value"]["path"]
                     if file_path.exists():
-                        step = (
-                            self._convert_step_to_int(row["step"], step_multiplier)
-                            if pd.notna(row["step"])
-                            else 0
-                        )
-                        artifact_name = f"{attr_name}_step_{step}"
-                        artifact = wandb.Artifact(
-                            name=artifact_name, type="file_series"
-                        )
+                        step = self._convert_step_to_int(row["step"], step_multiplier) if pd.notna(row["step"]) else 0
+                        artifact_name = self._make_artifact_name(attr_path, run_name, suffix=f"step_{step}")
+                        artifact = wandb.Artifact(name=artifact_name, type="file_series")
                         if file_path.is_file():
                             artifact.add_file(str(file_path))
                         else:
@@ -396,61 +405,40 @@ class WandBLoader(DataLoader):
         # Handle string series as text artifacts
         string_series_data = run_data[run_data["attribute_type"] == "string_series"]
         for attr_path, group in string_series_data.groupby("attribute_path"):
-            attr_name = self._sanitize_attribute_name(attr_path)
+            artifact_name = self._make_artifact_name(attr_path, run_name)
 
             # Create temporary file with text content
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".txt", encoding="utf-8"
-            ) as tmp_file:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", encoding="utf-8") as tmp_file:
                 for _, row in group.iterrows():
                     if pd.notna(row["string_value"]):
                         series_step = (
-                            self._convert_step_to_int(row["step"], step_multiplier)
-                            if pd.notna(row["step"])
-                            else None
+                            self._convert_step_to_int(row["step"], step_multiplier) if pd.notna(row["step"]) else None
                         )
-                        timestamp = (
-                            row["timestamp"].isoformat()
-                            if pd.notna(row["timestamp"])
-                            else None
-                        )
-                        text_line = (
-                            f"{series_step}; {timestamp}; {row['string_value']}\n"
-                        )
+                        timestamp = row["timestamp"].isoformat() if pd.notna(row["timestamp"]) else None
+                        text_line = f"{series_step}; {timestamp}; {row['string_value']}\n"
                         tmp_file.write(text_line)
                 tmp_file_path = tmp_file.name
 
                 # Create and log W&B artifact
-                artifact = wandb.Artifact(name=attr_name, type="string_series")
+                artifact = wandb.Artifact(name=artifact_name, type="string_series")
                 artifact.add_file(tmp_file_path, name="series.txt")
                 self._active_run.log_artifact(artifact)
 
         # Handle histogram series as W&B Histograms
-        histogram_series_data = run_data[
-            run_data["attribute_type"] == "histogram_series"
-        ]
+        histogram_series_data = run_data[run_data["attribute_type"] == "histogram_series"]
         for attr_path, group in histogram_series_data.groupby("attribute_path"):
             attr_name = self._sanitize_attribute_name(attr_path)
-            # Use global step multiplier
 
             for _, row in group.iterrows():
-                if pd.notna(row["histogram_value"]) and isinstance(
-                    row["histogram_value"], dict
-                ):
-                    step = (
-                        self._convert_step_to_int(row["step"], step_multiplier)
-                        if pd.notna(row["step"])
-                        else 0
-                    )
+                if pd.notna(row["histogram_value"]) and isinstance(row["histogram_value"], dict):
+                    step = self._convert_step_to_int(row["step"], step_multiplier) if pd.notna(row["step"]) else 0
                     hist = row["histogram_value"]
 
                     # Convert Neptune histogram to W&B Histogram
                     # Neptune format: {"type": str, "edges": list, "values": list}
                     # W&B expects histogram data as np_histogram tuple or sequence
                     try:
-                        wandb_hist = wandb.Histogram(
-                            np_histogram=(hist.get("values", []), hist.get("edges", []))
-                        )
+                        wandb_hist = wandb.Histogram(np_histogram=(hist.get("values", []), hist.get("edges", [])))
                         self._active_run.log({attr_name: wandb_hist}, step=step)
                     except Exception:
                         self._logger.error(
