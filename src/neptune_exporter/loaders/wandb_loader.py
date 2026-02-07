@@ -404,10 +404,26 @@ class WandBLoader(DataLoader):
                 else:
                     self._logger.warning(f"File not found: {file_path}")
 
-        # Handle file series — log images/HTML as native W&B media, others as artifacts
+        # Handle file series — log images/HTML as native W&B media, others as artifacts.
+        # Media uses define_metric with a custom step axis per series so it doesn't
+        # conflict with the global step used by float_series metrics.
         file_series_data = run_data[run_data["attribute_type"] == "file_series"]
         for attr_path, group in file_series_data.groupby("attribute_path"):
             attr_name = self._sanitize_attribute_name(attr_path)
+
+            # Detect if this series contains media files (check first valid file)
+            is_media_series = False
+            for _, probe_row in group.iterrows():
+                if pd.notna(probe_row["file_value"]) and isinstance(probe_row["file_value"], dict):
+                    probe_path = files_base_path / probe_row["file_value"]["path"]
+                    if probe_path.exists() and probe_path.is_file():
+                        is_media_series = _is_image(probe_path) or _is_html(probe_path)
+                        break
+
+            # Define a custom step axis for media series to avoid conflicts with metrics
+            step_key = f"{attr_name}_step"
+            if is_media_series:
+                self._active_run.define_metric(attr_name, step_metric=step_key)
 
             for _, row in group.iterrows():
                 if pd.notna(row["file_value"]) and isinstance(row["file_value"], dict):
@@ -416,11 +432,9 @@ class WandBLoader(DataLoader):
                         step = self._convert_step_to_int(row["step"], step_multiplier) if pd.notna(row["step"]) else 0
 
                         if file_path.is_file() and _is_image(file_path):
-                            # Log as native W&B media — appears in Media panel
-                            self._active_run.log({attr_name: wandb.Image(str(file_path))}, step=step)
+                            self._active_run.log({step_key: step, attr_name: wandb.Image(str(file_path))})
                         elif file_path.is_file() and _is_html(file_path):
-                            # Log as W&B HTML — preserves Plotly figures etc.
-                            self._active_run.log({attr_name: wandb.Html(str(file_path))}, step=step)
+                            self._active_run.log({step_key: step, attr_name: wandb.Html(str(file_path))})
                         else:
                             # Fall back to artifact for non-media files
                             artifact_name = self._make_artifact_name(attr_path, run_name, suffix=f"step_{step}")
