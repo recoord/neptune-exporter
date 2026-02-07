@@ -19,13 +19,26 @@ import logging
 import tempfile
 from decimal import Decimal
 from pathlib import Path
-from typing import Generator, Optional, Any
+from typing import Generator, Optional, Any, Union
 import pandas as pd
 import pyarrow as pa
 import wandb
 
 from neptune_exporter.types import ProjectId, TargetRunId, TargetExperimentId
 from neptune_exporter.loaders.loader import DataLoader
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
+HTML_EXTENSIONS = {".html", ".htm"}
+
+
+def _is_image(filename: Union[str, Path]) -> bool:
+    """Check if a file is an image based on its extension."""
+    return Path(filename).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def _is_html(filename: Union[str, Path]) -> bool:
+    """Check if a file is HTML based on its extension."""
+    return Path(filename).suffix.lower() in HTML_EXTENSIONS
 
 
 class WandBLoader(DataLoader):
@@ -368,37 +381,55 @@ class WandBLoader(DataLoader):
 
         run_name = self._current_run_name or run_id
 
-        # Handle regular files
+        # Handle regular files — log images/HTML as native W&B media, others as artifacts
         file_data = run_data[run_data["attribute_type"].isin(["file", "file_set", "artifact"])]
         for _, row in file_data.iterrows():
             if pd.notna(row["file_value"]) and isinstance(row["file_value"], dict):
                 file_path = files_base_path / row["file_value"]["path"]
                 if file_path.exists():
-                    artifact_name = self._make_artifact_name(row["attribute_path"], run_name)
-                    artifact = wandb.Artifact(name=artifact_name, type=row["attribute_type"])
-                    if file_path.is_file():
-                        artifact.add_file(str(file_path))
+                    if file_path.is_file() and _is_image(file_path):
+                        attr_name = self._sanitize_attribute_name(row["attribute_path"])
+                        self._active_run.log({attr_name: wandb.Image(str(file_path))})
+                    elif file_path.is_file() and _is_html(file_path):
+                        attr_name = self._sanitize_attribute_name(row["attribute_path"])
+                        self._active_run.log({attr_name: wandb.Html(str(file_path))})
                     else:
-                        artifact.add_dir(str(file_path))
-                    self._active_run.log_artifact(artifact)
-                else:
-                    self._logger.warning(f"File not found: {file_path}")
-
-        # Handle file series
-        file_series_data = run_data[run_data["attribute_type"] == "file_series"]
-        for attr_path, group in file_series_data.groupby("attribute_path"):
-            for _, row in group.iterrows():
-                if pd.notna(row["file_value"]) and isinstance(row["file_value"], dict):
-                    file_path = files_base_path / row["file_value"]["path"]
-                    if file_path.exists():
-                        step = self._convert_step_to_int(row["step"], step_multiplier) if pd.notna(row["step"]) else 0
-                        artifact_name = self._make_artifact_name(attr_path, run_name, suffix=f"step_{step}")
-                        artifact = wandb.Artifact(name=artifact_name, type="file_series")
+                        artifact_name = self._make_artifact_name(row["attribute_path"], run_name)
+                        artifact = wandb.Artifact(name=artifact_name, type=row["attribute_type"])
                         if file_path.is_file():
                             artifact.add_file(str(file_path))
                         else:
                             artifact.add_dir(str(file_path))
                         self._active_run.log_artifact(artifact)
+                else:
+                    self._logger.warning(f"File not found: {file_path}")
+
+        # Handle file series — log images/HTML as native W&B media, others as artifacts
+        file_series_data = run_data[run_data["attribute_type"] == "file_series"]
+        for attr_path, group in file_series_data.groupby("attribute_path"):
+            attr_name = self._sanitize_attribute_name(attr_path)
+
+            for _, row in group.iterrows():
+                if pd.notna(row["file_value"]) and isinstance(row["file_value"], dict):
+                    file_path = files_base_path / row["file_value"]["path"]
+                    if file_path.exists():
+                        step = self._convert_step_to_int(row["step"], step_multiplier) if pd.notna(row["step"]) else 0
+
+                        if file_path.is_file() and _is_image(file_path):
+                            # Log as native W&B media — appears in Media panel
+                            self._active_run.log({attr_name: wandb.Image(str(file_path))}, step=step)
+                        elif file_path.is_file() and _is_html(file_path):
+                            # Log as W&B HTML — preserves Plotly figures etc.
+                            self._active_run.log({attr_name: wandb.Html(str(file_path))}, step=step)
+                        else:
+                            # Fall back to artifact for non-media files
+                            artifact_name = self._make_artifact_name(attr_path, run_name, suffix=f"step_{step}")
+                            artifact = wandb.Artifact(name=artifact_name, type="file_series")
+                            if file_path.is_file():
+                                artifact.add_file(str(file_path))
+                            else:
+                                artifact.add_dir(str(file_path))
+                            self._active_run.log_artifact(artifact)
                     else:
                         self._logger.warning(f"File not found: {file_path}")
 
