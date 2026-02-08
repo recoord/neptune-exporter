@@ -41,6 +41,40 @@ def _is_html(filename: Union[str, Path]) -> bool:
     return Path(filename).suffix.lower() in HTML_EXTENSIONS
 
 
+def _extract_param_value(row: pd.Series) -> Any:
+    """Extract the parameter value from a parquet row based on its attribute_type."""
+    attr_type = row["attribute_type"]
+    if attr_type == "float" and pd.notna(row["float_value"]):
+        return row["float_value"]
+    elif attr_type == "int" and pd.notna(row["int_value"]):
+        return int(row["int_value"])
+    elif attr_type == "string" and pd.notna(row["string_value"]):
+        return row["string_value"]
+    elif attr_type == "bool" and pd.notna(row["bool_value"]):
+        return bool(row["bool_value"])
+    elif attr_type == "datetime" and pd.notna(row["datetime_value"]):
+        return str(row["datetime_value"])
+    elif attr_type == "string_set" and row["string_set_value"] is not None:
+        return list(row["string_set_value"])
+    return None
+
+
+def _deep_set(d: dict, keys: list[str], value: Any) -> None:
+    """Set a value in a nested dict using a list of keys.
+
+    If an intermediate key already exists as a non-dict (scalar), it is overwritten
+    with a dict to support the deeper path.
+    """
+    for key in keys[:-1]:
+        if key not in d or not isinstance(d[key], dict):
+            d[key] = {}
+        d = d[key]
+    d[keys[-1]] = value
+
+
+_NEPTUNE_SYSTEM_PREFIXES = ("sys/", "monitoring/", "metaflow/", "source_code/")
+
+
 class WandBLoader(DataLoader):
     """Loads Neptune data from parquet files into Weights & Biases."""
 
@@ -65,6 +99,7 @@ class WandBLoader(DataLoader):
         self._logger = logging.getLogger(__name__)
         self._active_run: Optional[wandb.Run] = None
         self._current_run_name: Optional[str] = None
+        self._pending_tags: set[str] = set()
 
         # Authenticate with W&B
         if api_key:
@@ -96,6 +131,17 @@ class WandBLoader(DataLoader):
             sanitized = "_attribute"
 
         return sanitized
+
+    def _clean_attribute_path(self, path: str) -> str:
+        """Strip Lightning's NeptuneLogger 'training/' prefix from attribute paths.
+
+        Lightning's NeptuneLogger defaults to prefix='training', which prepends
+        'training/' to all logged metrics, hyperparams, and checkpoints. Stripping
+        this makes migrated runs comparable with natively-logged W&B runs.
+        """
+        if path.startswith("training/"):
+            return path[len("training/") :]
+        return path
 
     def _make_artifact_name(self, attribute_path: str, run_name: str, suffix: str = "") -> str:
         """Create a W&B artifact name from Neptune attribute path and run name.
@@ -285,10 +331,15 @@ class WandBLoader(DataLoader):
                 self.upload_metrics(run_df, run_id, step_multiplier)
                 self.upload_artifacts(run_df, run_id, files_directory, step_multiplier)
 
+            # Set tags accumulated from all data chunks
+            if self._pending_tags:
+                self._active_run.tags = tuple(self._pending_tags)
+
             # Finish the run
             self._active_run.finish()
             self._active_run = None
             self._current_run_name = None
+            self._pending_tags = set()
 
             self._logger.info(f"Successfully uploaded run {run_id} to W&B")
 
@@ -298,10 +349,18 @@ class WandBLoader(DataLoader):
                 self._active_run.finish(exit_code=1)
                 self._active_run = None
                 self._current_run_name = None
+            self._pending_tags = set()
             raise
 
     def upload_parameters(self, run_data: pd.DataFrame, run_id: TargetRunId) -> None:
-        """Upload parameters (configs) to W&B run."""
+        """Upload parameters (configs) to W&B run.
+
+        Routes parameters by cleaned path prefix:
+        - config/*: stripped and nested into run.config as dicts
+        - sys/tags, sys/group_tags: collected into pending tags for run.tags
+        - sys/*, monitoring/*, metaflow/*, source_code/*: namespaced under _neptune/ in config
+        - everything else: flat keys in config
+        """
         if self._active_run is None:
             raise RuntimeError("No active run")
 
@@ -311,27 +370,45 @@ class WandBLoader(DataLoader):
         if param_data.empty:
             return
 
-        config = {}
+        config_nested: dict = {}
+        neptune_meta: dict = {}
+        config_flat: dict = {}
+
         for _, row in param_data.iterrows():
-            attr_name = self._sanitize_attribute_name(row["attribute_path"])
+            cleaned = self._clean_attribute_path(row["attribute_path"])
+            value = _extract_param_value(row)
+            if value is None:
+                continue
 
-            # Get the appropriate value based on attribute type
-            if row["attribute_type"] == "float" and pd.notna(row["float_value"]):
-                config[attr_name] = row["float_value"]
-            elif row["attribute_type"] == "int" and pd.notna(row["int_value"]):
-                config[attr_name] = int(row["int_value"])
-            elif row["attribute_type"] == "string" and pd.notna(row["string_value"]):
-                config[attr_name] = row["string_value"]
-            elif row["attribute_type"] == "bool" and pd.notna(row["bool_value"]):
-                config[attr_name] = bool(row["bool_value"])
-            elif row["attribute_type"] == "datetime" and pd.notna(row["datetime_value"]):
-                config[attr_name] = str(row["datetime_value"])
-            elif row["attribute_type"] == "string_set" and row["string_set_value"] is not None:
-                config[attr_name] = list(row["string_set_value"])
+            if cleaned.startswith("config/"):
+                # Strip "config/" prefix and build nested dict
+                key_path = cleaned[len("config/") :]
+                _deep_set(config_nested, key_path.split("/"), value)
 
-        if config:
-            self._active_run.config.update(config)
-            self._logger.info(f"Uploaded {len(config)} parameters for run {run_id}")
+            elif cleaned in ("sys/tags", "sys/group_tags"):
+                # Collect tags for run.tags (set later in upload_run_data)
+                if isinstance(value, list):
+                    self._pending_tags.update(value)
+
+            elif cleaned.startswith(_NEPTUNE_SYSTEM_PREFIXES):
+                # Namespace Neptune system metadata under _neptune/
+                _deep_set(neptune_meta, ["_neptune"] + cleaned.split("/"), value)
+
+            else:
+                # Everything else: flat key (e.g., "status", "hyperparams/lr")
+                attr_name = self._sanitize_attribute_name(cleaned)
+                config_flat[attr_name] = value
+
+        if config_nested:
+            self._active_run.config.update(config_nested)
+        if neptune_meta:
+            self._active_run.config.update(neptune_meta)
+        if config_flat:
+            self._active_run.config.update(config_flat)
+
+        param_count = len(config_nested) + len(neptune_meta) + len(config_flat)
+        if param_count:
+            self._logger.info(f"Uploaded {param_count} parameters for run {run_id}")
 
     def upload_metrics(self, run_data: pd.DataFrame, run_id: TargetRunId, step_multiplier: int) -> None:
         """Upload metrics (float series) to W&B run.
@@ -356,7 +433,8 @@ class WandBLoader(DataLoader):
                 metrics = {}
                 for _, row in group.iterrows():
                     if pd.notna(row["float_value"]):
-                        attr_name = self._sanitize_attribute_name(row["attribute_path"])
+                        cleaned = self._clean_attribute_path(row["attribute_path"])
+                        attr_name = self._sanitize_attribute_name(cleaned)
                         metrics[attr_name] = row["float_value"]
 
                 if metrics:
@@ -386,15 +464,16 @@ class WandBLoader(DataLoader):
         for _, row in file_data.iterrows():
             if pd.notna(row["file_value"]) and isinstance(row["file_value"], dict):
                 file_path = files_base_path / row["file_value"]["path"]
+                cleaned_path = self._clean_attribute_path(row["attribute_path"])
                 if file_path.exists():
                     if file_path.is_file() and _is_image(file_path):
-                        attr_name = self._sanitize_attribute_name(row["attribute_path"])
+                        attr_name = self._sanitize_attribute_name(cleaned_path)
                         self._active_run.log({attr_name: wandb.Image(str(file_path))})
                     elif file_path.is_file() and _is_html(file_path):
-                        attr_name = self._sanitize_attribute_name(row["attribute_path"])
+                        attr_name = self._sanitize_attribute_name(cleaned_path)
                         self._active_run.log({attr_name: wandb.Html(str(file_path))})
                     else:
-                        artifact_name = self._make_artifact_name(row["attribute_path"], run_name)
+                        artifact_name = self._make_artifact_name(cleaned_path, run_name)
                         artifact = wandb.Artifact(name=artifact_name, type=row["attribute_type"])
                         if file_path.is_file():
                             artifact.add_file(str(file_path))
@@ -407,7 +486,8 @@ class WandBLoader(DataLoader):
         # Handle file series — log images/HTML as native W&B media, others as artifacts.
         # Media uses define_metric with a custom step axis per series so it doesn't
         # conflict with the global step used by float_series metrics.
-        file_series_data = run_data[run_data["attribute_type"] == "file_series"]
+        file_series_data = run_data[run_data["attribute_type"] == "file_series"].copy()
+        file_series_data["attribute_path"] = file_series_data["attribute_path"].apply(self._clean_attribute_path)
         for attr_path, group in file_series_data.groupby("attribute_path"):
             attr_name = self._sanitize_attribute_name(attr_path)
 
@@ -448,7 +528,8 @@ class WandBLoader(DataLoader):
                         self._logger.warning(f"File not found: {file_path}")
 
         # Handle string series as text artifacts
-        string_series_data = run_data[run_data["attribute_type"] == "string_series"]
+        string_series_data = run_data[run_data["attribute_type"] == "string_series"].copy()
+        string_series_data["attribute_path"] = string_series_data["attribute_path"].apply(self._clean_attribute_path)
         for attr_path, group in string_series_data.groupby("attribute_path"):
             artifact_name = self._make_artifact_name(attr_path, run_name)
 
@@ -470,7 +551,10 @@ class WandBLoader(DataLoader):
                 self._active_run.log_artifact(artifact)
 
         # Handle histogram series as W&B Histograms
-        histogram_series_data = run_data[run_data["attribute_type"] == "histogram_series"]
+        histogram_series_data = run_data[run_data["attribute_type"] == "histogram_series"].copy()
+        histogram_series_data["attribute_path"] = histogram_series_data["attribute_path"].apply(
+            self._clean_attribute_path
+        )
         for attr_path, group in histogram_series_data.groupby("attribute_path"):
             attr_name = self._sanitize_attribute_name(attr_path)
 
