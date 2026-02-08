@@ -74,6 +74,47 @@ def _deep_set(d: dict, keys: list[str], value: Any) -> None:
 
 _NEPTUNE_SYSTEM_PREFIXES = ("sys/", "monitoring/", "metaflow/", "source_code/")
 
+CHECKPOINT_PATH_PREFIXES = (
+    "model/checkpoints/",
+    "checkpoint/files/",
+    "checkpoint/",
+    "checkpoints/",
+)
+
+CHECKPOINT_NAME_RE = re.compile(r"epoch[_=](\d+)(?:[-_]step[_=](\d+))?")
+
+
+def _is_checkpoint_path(cleaned_path: str) -> bool:
+    """Check if a cleaned attribute path refers to a checkpoint file."""
+    return any(cleaned_path.startswith(prefix) for prefix in CHECKPOINT_PATH_PREFIXES)
+
+
+def _is_onnx_path(cleaned_path: str) -> bool:
+    """Check if a cleaned attribute path refers to an ONNX file."""
+    return "onnx" in cleaned_path.lower()
+
+
+def _parse_checkpoint_stem(stem: str) -> tuple[int | None, int | None]:
+    """Parse epoch and step from a checkpoint filename stem.
+
+    Handles both old (=) and new (_) conventions:
+    - epoch=0035 -> (35, None)
+    - epoch=16-step=34000 -> (16, 34000)
+    - model_step=002756 -> (None, 2756)
+    - epoch_00010-step_00001000 -> (10, 1000)
+    - last -> (None, None)
+    """
+    match = CHECKPOINT_NAME_RE.search(stem)
+    if match:
+        epoch = int(match.group(1))
+        step = int(match.group(2)) if match.group(2) else None
+        return epoch, step
+    # Handle model_step=XXXX (GIM convention)
+    step_match = re.search(r"(?:model_)?step[_=](\d+)", stem)
+    if step_match:
+        return None, int(step_match.group(1))
+    return None, None
+
 
 class WandBLoader(DataLoader):
     """Loads Neptune data from parquet files into Weights & Biases."""
@@ -352,6 +393,66 @@ class WandBLoader(DataLoader):
             self._pending_tags = set()
             raise
 
+    def _upload_best_model_metadata(self, param_data: pd.DataFrame) -> set[str]:
+        """Extract best model metadata from params and write to run.summary.
+
+        Looks for:
+        - model/best_model_path (string) — full path, we extract the stem
+        - model/best_model_score (float) — metric value
+        - config/model/best_model_monitor (string, optional) — metric name
+
+        Writes to run.summary matching Sunstone's WandBTracker convention:
+        - metadata/checkpoint/best_model_name_{monitor} = checkpoint stem
+        - metadata/checkpoint/best_model_score_{monitor} = score
+
+        Returns set of original (uncleaned) attribute paths that were handled,
+        so upload_parameters can exclude them from config.
+        """
+        if self._active_run is None:
+            return set()
+
+        handled_paths: set[str] = set()
+        best_path_value: str | None = None
+        best_score_value: float | None = None
+        monitor_value: str | None = None
+
+        for _, row in param_data.iterrows():
+            cleaned = self._clean_attribute_path(row["attribute_path"])
+            if cleaned == "model/best_model_path":
+                value = _extract_param_value(row)
+                if isinstance(value, str) and value:
+                    best_path_value = value
+                    handled_paths.add(row["attribute_path"])
+            elif cleaned == "model/best_model_score":
+                value = _extract_param_value(row)
+                if isinstance(value, (int, float)):
+                    best_score_value = float(value)
+                    handled_paths.add(row["attribute_path"])
+            elif cleaned == "config/model/best_model_monitor":
+                value = _extract_param_value(row)
+                if isinstance(value, str) and value:
+                    monitor_value = value
+                    handled_paths.add(row["attribute_path"])
+
+        if best_path_value is None:
+            return handled_paths
+
+        # Extract stem from path: "/checkpoints/model_step=002756.ckpt" -> "model_step=002756"
+        stem = Path(best_path_value).stem
+
+        # Sanitize monitor for use as key suffix (replace / with _)
+        monitor_sanitized = monitor_value.replace("/", "_") if monitor_value else "unknown"
+
+        self._active_run.summary[f"metadata/checkpoint/best_model_name_{monitor_sanitized}"] = stem
+        if best_score_value is not None:
+            self._active_run.summary[f"metadata/checkpoint/best_model_score_{monitor_sanitized}"] = best_score_value
+
+        self._logger.info(
+            f"Set best model metadata: monitor={monitor_sanitized}, name={stem}, score={best_score_value}"
+        )
+
+        return handled_paths
+
     def upload_parameters(self, run_data: pd.DataFrame, run_id: TargetRunId) -> None:
         """Upload parameters (configs) to W&B run.
 
@@ -370,11 +471,17 @@ class WandBLoader(DataLoader):
         if param_data.empty:
             return
 
+        # Extract and write best model metadata to run.summary (before routing to config)
+        handled_paths = self._upload_best_model_metadata(param_data)
+
         config_nested: dict = {}
         neptune_meta: dict = {}
         config_flat: dict = {}
 
         for _, row in param_data.iterrows():
+            if row["attribute_path"] in handled_paths:
+                continue
+
             cleaned = self._clean_attribute_path(row["attribute_path"])
             value = _extract_param_value(row)
             if value is None:
@@ -459,29 +566,98 @@ class WandBLoader(DataLoader):
 
         run_name = self._current_run_name or run_id
 
-        # Handle regular files — log images/HTML as native W&B media, others as artifacts
+        # Handle regular files — separate checkpoints and ONNX from other files
         file_data = run_data[run_data["attribute_type"].isin(["file", "file_set", "artifact"])]
+
+        checkpoint_rows: list[tuple[str, Path, pd.Series]] = []
+        onnx_rows: list[tuple[str, Path, pd.Series]] = []
+        other_rows: list[tuple[str, Path, pd.Series]] = []
+
         for _, row in file_data.iterrows():
             if pd.notna(row["file_value"]) and isinstance(row["file_value"], dict):
                 file_path = files_base_path / row["file_value"]["path"]
                 cleaned_path = self._clean_attribute_path(row["attribute_path"])
-                if file_path.exists():
-                    if file_path.is_file() and _is_image(file_path):
-                        attr_name = self._sanitize_attribute_name(cleaned_path)
-                        self._active_run.log({attr_name: wandb.Image(str(file_path))})
-                    elif file_path.is_file() and _is_html(file_path):
-                        attr_name = self._sanitize_attribute_name(cleaned_path)
-                        self._active_run.log({attr_name: wandb.Html(str(file_path))})
-                    else:
-                        artifact_name = self._make_artifact_name(cleaned_path, run_name)
-                        artifact = wandb.Artifact(name=artifact_name, type=row["attribute_type"])
-                        if file_path.is_file():
-                            artifact.add_file(str(file_path))
-                        else:
-                            artifact.add_dir(str(file_path))
-                        self._active_run.log_artifact(artifact)
+                if _is_checkpoint_path(cleaned_path):
+                    checkpoint_rows.append((cleaned_path, file_path, row))
+                elif _is_onnx_path(cleaned_path):
+                    onnx_rows.append((cleaned_path, file_path, row))
                 else:
-                    self._logger.warning(f"File not found: {file_path}")
+                    other_rows.append((cleaned_path, file_path, row))
+
+        # Upload checkpoints as versioned W&B artifacts matching Sunstone conventions
+        def _ckpt_sort_key(item: tuple[str, Path, pd.Series]) -> tuple[float, float]:
+            cleaned_path, _file_path, _row = item
+            stem = Path(cleaned_path).name
+            if stem == "last":
+                return (float("inf"), float("inf"))
+            epoch, step = _parse_checkpoint_stem(stem)
+            return (epoch if epoch is not None else 0, step if step is not None else 0)
+
+        checkpoint_rows.sort(key=_ckpt_sort_key)
+
+        for cleaned_path, file_path, row in checkpoint_rows:
+            if not file_path.exists() or not file_path.is_file():
+                self._logger.warning(f"Checkpoint file not found: {file_path}")
+                continue
+
+            stem = Path(cleaned_path).name
+            epoch, step = _parse_checkpoint_stem(stem)
+            is_last = stem == "last"
+
+            artifact = wandb.Artifact(
+                name=f"checkpoints-{self._active_run.id}",
+                type="checkpoint",
+                metadata={"filename": stem, "epoch": epoch, "step": step, "is_last": is_last},
+            )
+            # Add .ckpt extension if file has none (Neptune strips extensions)
+            upload_name = f"{stem}.ckpt" if not Path(stem).suffix else stem
+            artifact.add_file(str(file_path), name=upload_name)
+
+            aliases = ["latest"]
+            if not is_last:
+                aliases.append(stem)
+            if is_last:
+                aliases.append("last")
+
+            self._active_run.log_artifact(artifact, aliases=aliases)
+
+        # Upload ONNX files as versioned W&B artifacts
+        for cleaned_path, file_path, row in onnx_rows:
+            if not file_path.exists() or not file_path.is_file():
+                self._logger.warning(f"ONNX file not found: {file_path}")
+                continue
+
+            stem = Path(cleaned_path).name
+            artifact = wandb.Artifact(
+                name=f"onnx-{self._active_run.id}",
+                type="onnx",
+                metadata={"filename": stem},
+            )
+            upload_name = f"{stem}.onnx" if not Path(stem).suffix else stem
+            artifact.add_file(str(file_path), name=upload_name)
+
+            aliases = ["latest", stem]
+            self._active_run.log_artifact(artifact, aliases=aliases)
+
+        # Handle remaining files — log images/HTML as native W&B media, others as artifacts
+        for cleaned_path, file_path, row in other_rows:
+            if file_path.exists():
+                if file_path.is_file() and _is_image(file_path):
+                    attr_name = self._sanitize_attribute_name(cleaned_path)
+                    self._active_run.log({attr_name: wandb.Image(str(file_path))})
+                elif file_path.is_file() and _is_html(file_path):
+                    attr_name = self._sanitize_attribute_name(cleaned_path)
+                    self._active_run.log({attr_name: wandb.Html(str(file_path))})
+                else:
+                    artifact_name = self._make_artifact_name(cleaned_path, run_name)
+                    artifact = wandb.Artifact(name=artifact_name, type=row["attribute_type"])
+                    if file_path.is_file():
+                        artifact.add_file(str(file_path))
+                    else:
+                        artifact.add_dir(str(file_path))
+                    self._active_run.log_artifact(artifact)
+            else:
+                self._logger.warning(f"File not found: {file_path}")
 
         # Handle file series — log images/HTML as native W&B media, others as artifacts.
         # Media uses define_metric with a custom step axis per series so it doesn't
