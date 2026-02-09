@@ -53,10 +53,10 @@ def test_sanitize_attribute_name():
     # Test normal name
     assert loader._sanitize_attribute_name("normal_name") == "normal_name"
 
-    # Test name with invalid characters (W&B only allows letters, numbers, underscores)
+    # Test name with invalid characters (W&B preserves "/" for hierarchical grouping)
     assert (
         loader._sanitize_attribute_name("invalid@name#with$chars/slashes")
-        == "invalid_name_with_chars_slashes"
+        == "invalid_name_with_chars/slashes"
     )
 
     # Test name starting with number (must start with letter or underscore)
@@ -71,15 +71,11 @@ def test_get_project_name():
     loader = WandBLoader(entity="test-entity", name_prefix="test-prefix")
     loader_no_prefix = WandBLoader(entity="test-entity")
 
-    # Test with prefix
-    assert (
-        loader._get_project_name("my-org/my-project") == "test-prefix_my-org_my-project"
-    )
+    # Test with prefix (org prefix is stripped)
+    assert loader._get_project_name("my-org/my-project") == "test-prefix_my-project"
 
-    # Test without prefix
-    assert (
-        loader_no_prefix._get_project_name("my-org/my-project") == "my-org_my-project"
-    )
+    # Test without prefix (org prefix is stripped)
+    assert loader_no_prefix._get_project_name("my-org/my-project") == "my-project"
 
 
 def test_convert_step_to_int():
@@ -176,12 +172,12 @@ def test_upload_parameters():
     mock_config.update.assert_called_once()
     config_dict = mock_config.update.call_args[0][0]
 
-    assert "test_param1" in config_dict
-    assert "test_param2" in config_dict
-    assert "test_param3" in config_dict
-    assert config_dict["test_param1"] == "test_value"
-    assert config_dict["test_param2"] == 3.14
-    assert config_dict["test_param3"] == 42
+    assert "test/param1" in config_dict
+    assert "test/param2" in config_dict
+    assert "test/param3" in config_dict
+    assert config_dict["test/param1"] == "test_value"
+    assert config_dict["test/param2"] == 3.14
+    assert config_dict["test/param3"] == 42
 
 
 def test_upload_parameters_string_set():
@@ -211,8 +207,8 @@ def test_upload_parameters_string_set():
     mock_config.update.assert_called_once()
     config_dict = mock_config.update.call_args[0][0]
 
-    assert "test_string_set" in config_dict
-    assert config_dict["test_string_set"] == ["value1", "value2", "value3"]
+    assert "test/string_set" in config_dict
+    assert config_dict["test/string_set"] == ["value1", "value2", "value3"]
 
 
 def test_upload_metrics():
@@ -327,6 +323,7 @@ def test_upload_artifacts_string_series():
 
     mock_run = Mock()
     loader._active_run = mock_run
+    loader._current_run_name = "RUN-123"
 
     test_data = pd.DataFrame(
         {
@@ -357,9 +354,9 @@ def test_upload_artifacts_string_series():
             test_data, "RUN-123", files_base_path, step_multiplier=1
         )
 
-        # Verify artifact was created and logged
+        # Verify artifact was created and logged (name is scoped per-run)
         mock_artifact_class.assert_called_once_with(
-            name="test_string_series", type="string_series"
+            name="test__string_series-RUN-123", type="string_series"
         )
         mock_artifact.add_file.assert_called_once()
         mock_run.log_artifact.assert_called_once_with(mock_artifact)
@@ -567,3 +564,417 @@ def test_upload_run_data():
         mock_run.log.assert_called()  # Metrics
         mock_run.log_artifact.assert_called_once()  # Files
         mock_run.finish.assert_called_once()  # Run finished
+
+
+def test_parse_checkpoint_stem():
+    """Test parsing epoch and step from checkpoint filename stems."""
+    from neptune_exporter.loaders.wandb_loader import _parse_checkpoint_stem
+
+    assert _parse_checkpoint_stem("epoch=0035") == (35, None)
+    assert _parse_checkpoint_stem("epoch=16-step=34000") == (16, 34000)
+    assert _parse_checkpoint_stem("model_step=002756") == (None, 2756)
+    assert _parse_checkpoint_stem("epoch_00010-step_00001000") == (10, 1000)
+    assert _parse_checkpoint_stem("last") == (None, None)
+
+
+def test_ckpt_sort_key():
+    """Test checkpoint sort key ordering."""
+    from neptune_exporter.loaders.wandb_loader import _ckpt_sort_key
+
+    items = [
+        ("model/checkpoints/epoch=0035", Path("/fake")),
+        ("model/checkpoints/epoch=0005", Path("/fake")),
+        ("model/checkpoints/epoch=0010", Path("/fake")),
+        ("model/checkpoints/last", Path("/fake")),
+    ]
+    sorted_items = sorted(items, key=_ckpt_sort_key)
+    assert [Path(i[0]).name for i in sorted_items] == [
+        "epoch=0005",
+        "epoch=0010",
+        "epoch=0035",
+        "last",
+    ]
+
+    # Step-only sorting
+    step_items = [
+        ("model/checkpoints/model_step=002756", Path("/fake")),
+        ("model/checkpoints/model_step=000100", Path("/fake")),
+    ]
+    sorted_step = sorted(step_items, key=_ckpt_sort_key)
+    assert [Path(i[0]).name for i in sorted_step] == [
+        "model_step=000100",
+        "model_step=002756",
+    ]
+
+
+def test_upload_best_model_metadata():
+    """Test best model metadata extraction and summary writing."""
+    loader = WandBLoader(entity="test-entity")
+    mock_run = Mock()
+    mock_run.summary = {}
+    loader._active_run = mock_run
+
+    # Test with all 3 keys
+    param_data = pd.DataFrame(
+        {
+            "attribute_path": [
+                "model/best_model_path",
+                "model/best_model_score",
+                "config/model/best_model_monitor",
+            ],
+            "attribute_type": ["string", "float", "string"],
+            "string_value": ["/checkpoints/epoch=0035.ckpt", None, "val/loss"],
+            "float_value": [None, 0.123, None],
+            "int_value": [None, None, None],
+            "bool_value": [None, None, None],
+            "datetime_value": [None, None, None],
+            "string_set_value": [None, None, None],
+        }
+    )
+
+    handled = loader._upload_best_model_metadata(param_data)
+    assert len(handled) == 3
+    assert (
+        mock_run.summary["metadata/checkpoint/best_model_name_val_loss"] == "epoch=0035"
+    )
+    assert mock_run.summary["metadata/checkpoint/best_model_score_val_loss"] == 0.123
+
+    # Test with no monitor (defaults to "unknown")
+    mock_run.summary = {}
+    param_data_no_monitor = pd.DataFrame(
+        {
+            "attribute_path": ["model/best_model_path", "model/best_model_score"],
+            "attribute_type": ["string", "float"],
+            "string_value": ["/checkpoints/model_step=002756.ckpt", None],
+            "float_value": [None, 0.456],
+            "int_value": [None, None],
+            "bool_value": [None, None],
+            "datetime_value": [None, None],
+            "string_set_value": [None, None],
+        }
+    )
+
+    handled = loader._upload_best_model_metadata(param_data_no_monitor)
+    assert (
+        mock_run.summary["metadata/checkpoint/best_model_name_unknown"]
+        == "model_step=002756"
+    )
+
+    # Test with no best_model_path (no-op)
+    mock_run.summary = {}
+    param_data_empty = pd.DataFrame(
+        {
+            "attribute_path": ["some/other/param"],
+            "attribute_type": ["string"],
+            "string_value": ["hello"],
+            "float_value": [None],
+            "int_value": [None],
+            "bool_value": [None],
+            "datetime_value": [None],
+            "string_set_value": [None],
+        }
+    )
+
+    handled = loader._upload_best_model_metadata(param_data_empty)
+    assert len(mock_run.summary) == 0
+
+
+def test_cross_chunk_checkpoint_accumulation():
+    """Test that checkpoints from multiple parquet chunks are sorted globally before upload."""
+    from neptune_exporter import model
+
+    loader = WandBLoader(entity="test-entity")
+
+    # Chunk 1: epoch=10 checkpoint
+    chunk1_df = pd.DataFrame(
+        {
+            "project_id": ["test-project"],
+            "run_id": ["RUN-123"],
+            "attribute_path": ["model/checkpoints/epoch=0010"],
+            "attribute_type": ["file"],
+            "step": [None],
+            "timestamp": [None],
+            "int_value": [None],
+            "float_value": [None],
+            "string_value": [None],
+            "bool_value": [None],
+            "datetime_value": [None],
+            "string_set_value": [None],
+            "file_value": [{"path": "ckpt/epoch=0010.ckpt"}],
+            "histogram_value": [None],
+        }
+    )
+
+    # Chunk 2: epoch=5 checkpoint (earlier epoch, but in later chunk)
+    chunk2_df = pd.DataFrame(
+        {
+            "project_id": ["test-project"],
+            "run_id": ["RUN-123"],
+            "attribute_path": ["model/checkpoints/epoch=0005"],
+            "attribute_type": ["file"],
+            "step": [None],
+            "timestamp": [None],
+            "int_value": [None],
+            "float_value": [None],
+            "string_value": [None],
+            "bool_value": [None],
+            "datetime_value": [None],
+            "string_set_value": [None],
+            "file_value": [{"path": "ckpt/epoch=0005.ckpt"}],
+            "histogram_value": [None],
+        }
+    )
+
+    chunk1 = pa.Table.from_pandas(chunk1_df, schema=model.SCHEMA)
+    chunk2 = pa.Table.from_pandas(chunk2_df, schema=model.SCHEMA)
+
+    def two_chunk_generator():
+        yield chunk1
+        yield chunk2
+
+    with (
+        patch("wandb.init", spec=wandb.init) as mock_init,
+        patch("pathlib.Path.exists", return_value=True),
+        patch("pathlib.Path.is_file", return_value=True),
+        patch("wandb.Artifact", spec=wandb.Artifact) as mock_artifact_class,
+    ):
+        mock_run = Mock()
+        mock_run.id = "test-run-id"
+        mock_run.config = Mock()
+        mock_init.return_value = mock_run
+        mock_artifact_class.return_value = Mock()
+
+        # Create run first
+        loader.create_run("test-project", "test-run", "test-experiment")
+
+        # Upload with 2-chunk generator
+        loader.upload_run_data(
+            two_chunk_generator(), "test-run-id", Path("/test/files"), step_multiplier=1
+        )
+
+        # Get all Artifact() calls
+        artifact_calls = mock_artifact_class.call_args_list
+
+        # Should have 2 checkpoint artifacts
+        assert len(artifact_calls) == 2
+
+        # First artifact should be epoch=5, second should be epoch=10
+        first_metadata = artifact_calls[0][1]["metadata"]
+        second_metadata = artifact_calls[1][1]["metadata"]
+        assert first_metadata["epoch"] == 5, (
+            f"Expected epoch=5 first, got {first_metadata}"
+        )
+        assert second_metadata["epoch"] == 10, (
+            f"Expected epoch=10 second, got {second_metadata}"
+        )
+
+        # Verify aliases: epoch-based checkpoints get ["latest", stem]
+        alias_calls = mock_run.log_artifact.call_args_list
+        assert alias_calls[0][1]["aliases"] == ["latest", "epoch=0005"]
+        assert alias_calls[1][1]["aliases"] == ["latest", "epoch=0010"]
+
+
+def test_cross_chunk_last_checkpoint_sorts_last():
+    """Test that 'last' checkpoint sorts after all epoch-based checkpoints across chunks."""
+    from neptune_exporter import model
+
+    loader = WandBLoader(entity="test-entity")
+
+    # Chunk 1: "last" checkpoint (arrives first but should sort last)
+    chunk1_df = pd.DataFrame(
+        {
+            "project_id": ["test-project"],
+            "run_id": ["RUN-123"],
+            "attribute_path": ["model/checkpoints/last"],
+            "attribute_type": ["file"],
+            "step": [None],
+            "timestamp": [None],
+            "int_value": [None],
+            "float_value": [None],
+            "string_value": [None],
+            "bool_value": [None],
+            "datetime_value": [None],
+            "string_set_value": [None],
+            "file_value": [{"path": "ckpt/last.ckpt"}],
+            "histogram_value": [None],
+        }
+    )
+
+    # Chunk 2: epoch=5 checkpoint (lower epoch, arrives second)
+    chunk2_df = pd.DataFrame(
+        {
+            "project_id": ["test-project"],
+            "run_id": ["RUN-123"],
+            "attribute_path": ["model/checkpoints/epoch=0005"],
+            "attribute_type": ["file"],
+            "step": [None],
+            "timestamp": [None],
+            "int_value": [None],
+            "float_value": [None],
+            "string_value": [None],
+            "bool_value": [None],
+            "datetime_value": [None],
+            "string_set_value": [None],
+            "file_value": [{"path": "ckpt/epoch=0005.ckpt"}],
+            "histogram_value": [None],
+        }
+    )
+
+    chunk1 = pa.Table.from_pandas(chunk1_df, schema=model.SCHEMA)
+    chunk2 = pa.Table.from_pandas(chunk2_df, schema=model.SCHEMA)
+
+    def two_chunk_generator():
+        yield chunk1
+        yield chunk2
+
+    with (
+        patch("wandb.init", spec=wandb.init) as mock_init,
+        patch("pathlib.Path.exists", return_value=True),
+        patch("pathlib.Path.is_file", return_value=True),
+        patch("wandb.Artifact", spec=wandb.Artifact) as mock_artifact_class,
+    ):
+        mock_run = Mock()
+        mock_run.id = "test-run-id"
+        mock_run.config = Mock()
+        mock_init.return_value = mock_run
+        mock_artifact_class.return_value = Mock()
+
+        loader.create_run("test-project", "test-run", "test-experiment")
+
+        loader.upload_run_data(
+            two_chunk_generator(), "test-run-id", Path("/test/files"), step_multiplier=1
+        )
+
+        artifact_calls = mock_artifact_class.call_args_list
+        assert len(artifact_calls) == 2
+
+        # epoch=5 should be first (version 1), "last" should be second (version 2)
+        first_metadata = artifact_calls[0][1]["metadata"]
+        second_metadata = artifact_calls[1][1]["metadata"]
+        assert first_metadata["epoch"] == 5, (
+            f"Expected epoch=5 first, got {first_metadata}"
+        )
+        assert second_metadata["is_last"] is True, (
+            f"Expected 'last' second, got {second_metadata}"
+        )
+
+        # Verify aliases: epoch gets ["latest", stem], last gets ["latest", "last"]
+        alias_calls = mock_run.log_artifact.call_args_list
+        assert alias_calls[0][1]["aliases"] == ["latest", "epoch=0005"]
+        assert alias_calls[1][1]["aliases"] == ["latest", "last"]
+
+
+def test_state_cleanup_after_upload_failure():
+    """Test that pending state is cleared when upload_run_data fails mid-upload."""
+    from neptune_exporter import model
+
+    loader = WandBLoader(entity="test-entity")
+
+    chunk_df = pd.DataFrame(
+        {
+            "project_id": ["test-project"],
+            "run_id": ["RUN-123"],
+            "attribute_path": ["model/checkpoints/epoch=0010"],
+            "attribute_type": ["file"],
+            "step": [None],
+            "timestamp": [None],
+            "int_value": [None],
+            "float_value": [None],
+            "string_value": [None],
+            "bool_value": [None],
+            "datetime_value": [None],
+            "string_set_value": [None],
+            "file_value": [{"path": "ckpt/epoch=0010.ckpt"}],
+            "histogram_value": [None],
+        }
+    )
+    chunk = pa.Table.from_pandas(chunk_df, schema=model.SCHEMA)
+
+    def failing_generator():
+        yield chunk
+        raise RuntimeError("Simulated chunk read failure")
+
+    with (
+        patch("wandb.init", spec=wandb.init) as mock_init,
+        patch("pathlib.Path.exists", return_value=True),
+        patch("pathlib.Path.is_file", return_value=True),
+    ):
+        mock_run = Mock()
+        mock_run.id = "test-run-id"
+        mock_run.config = Mock()
+        mock_init.return_value = mock_run
+
+        loader.create_run("test-project", "test-run", "test-experiment")
+
+        import pytest
+
+        with pytest.raises(RuntimeError, match="Simulated chunk read failure"):
+            loader.upload_run_data(
+                failing_generator(), "test-run-id", Path("/test/files"), step_multiplier=1
+            )
+
+        # Verify all state is cleaned up
+        assert loader._pending_checkpoints == []
+        assert loader._pending_onnx == []
+        assert loader._pending_tags == set()
+        assert loader._active_run is None
+        assert loader._current_run_name is None
+
+
+def test_state_cleanup_when_finish_throws():
+    """Test that state is cleaned up even when finish(exit_code=1) raises."""
+    from neptune_exporter import model
+
+    loader = WandBLoader(entity="test-entity")
+
+    chunk_df = pd.DataFrame(
+        {
+            "project_id": ["test-project"],
+            "run_id": ["RUN-123"],
+            "attribute_path": ["model/checkpoints/epoch=0010"],
+            "attribute_type": ["file"],
+            "step": [None],
+            "timestamp": [None],
+            "int_value": [None],
+            "float_value": [None],
+            "string_value": [None],
+            "bool_value": [None],
+            "datetime_value": [None],
+            "string_set_value": [None],
+            "file_value": [{"path": "ckpt/epoch=0010.ckpt"}],
+            "histogram_value": [None],
+        }
+    )
+    chunk = pa.Table.from_pandas(chunk_df, schema=model.SCHEMA)
+
+    def failing_generator():
+        yield chunk
+        raise RuntimeError("Simulated chunk read failure")
+
+    with (
+        patch("wandb.init", spec=wandb.init) as mock_init,
+        patch("pathlib.Path.exists", return_value=True),
+        patch("pathlib.Path.is_file", return_value=True),
+    ):
+        mock_run = Mock()
+        mock_run.id = "test-run-id"
+        mock_run.config = Mock()
+        # Make finish() raise to simulate network error during cleanup
+        mock_run.finish.side_effect = ConnectionError("W&B server unreachable")
+        mock_init.return_value = mock_run
+
+        loader.create_run("test-project", "test-run", "test-experiment")
+
+        import pytest
+
+        with pytest.raises(RuntimeError, match="Simulated chunk read failure"):
+            loader.upload_run_data(
+                failing_generator(), "test-run-id", Path("/test/files"), step_multiplier=1
+            )
+
+        # State must still be cleaned up despite finish() throwing
+        assert loader._pending_checkpoints == []
+        assert loader._pending_onnx == []
+        assert loader._pending_tags == set()
+        assert loader._active_run is None
+        assert loader._current_run_name is None

@@ -116,6 +116,21 @@ def _parse_checkpoint_stem(stem: str) -> tuple[int | None, int | None]:
     return None, None
 
 
+def _ckpt_sort_key(item: tuple[str, Path]) -> tuple[float, float]:
+    """Sort key for checkpoint files by (epoch, step).
+
+    epoch=None maps to 0 so step-only checkpoints (e.g. GIM's model_step=2756) sort
+    before all epoch-based checkpoints. This is acceptable because no single run mixes
+    both conventions.
+    """
+    cleaned_path, _file_path = item
+    stem = Path(cleaned_path).name
+    if stem == "last":
+        return (float("inf"), float("inf"))
+    epoch, step = _parse_checkpoint_stem(stem)
+    return (epoch if epoch is not None else 0, step if step is not None else 0)
+
+
 class WandBLoader(DataLoader):
     """Loads Neptune data from parquet files into Weights & Biases."""
 
@@ -133,7 +148,7 @@ class WandBLoader(DataLoader):
             entity: W&B entity (organization/username)
             api_key: Optional W&B API key for authentication
             name_prefix: Optional prefix for project and run names
-            verbose: Enable verbose logging
+            show_client_logs: Enable W&B client logging
         """
         self.entity = entity
         self.name_prefix = name_prefix
@@ -141,6 +156,8 @@ class WandBLoader(DataLoader):
         self._active_run: Optional[wandb.Run] = None
         self._current_run_name: Optional[str] = None
         self._pending_tags: set[str] = set()
+        self._pending_checkpoints: list[tuple[str, Path]] = []
+        self._pending_onnx: list[tuple[str, Path]] = []
 
         # Authenticate with W&B
         if api_key:
@@ -184,7 +201,9 @@ class WandBLoader(DataLoader):
             return path[len("training/") :]
         return path
 
-    def _make_artifact_name(self, attribute_path: str, run_name: str, suffix: str = "") -> str:
+    def _make_artifact_name(
+        self, attribute_path: str, run_name: str, suffix: str = ""
+    ) -> str:
         """Create a W&B artifact name from Neptune attribute path and run name.
 
         Artifact names cannot contain "/" so we use "__" to preserve hierarchy
@@ -235,7 +254,9 @@ class WandBLoader(DataLoader):
             return 0
         return int(float(step) * step_multiplier)
 
-    def create_experiment(self, project_id: str, experiment_name: str) -> TargetExperimentId:
+    def create_experiment(
+        self, project_id: str, experiment_name: str
+    ) -> TargetExperimentId:
         """
         Neptune experiment_name maps to W&B group (set in create_run).
         We return the experiment name as the group name to use.
@@ -318,8 +339,12 @@ class WandBLoader(DataLoader):
                 # step_multiplier should always be provided when fork_step is set
                 if fork_step is not None:
                     if step_multiplier is None:
-                        raise ValueError("step_multiplier must be provided when fork_step is set")
-                    step_int = self._convert_step_to_int(Decimal(str(fork_step)), step_multiplier)
+                        raise ValueError(
+                            "step_multiplier must be provided when fork_step is set"
+                        )
+                    step_int = self._convert_step_to_int(
+                        Decimal(str(fork_step)), step_multiplier
+                    )
                 else:
                     step_int = 0
 
@@ -327,7 +352,9 @@ class WandBLoader(DataLoader):
                 # https://docs.wandb.ai/models/runs/forking
                 fork_from = f"{parent_run_id}?_step={step_int}"
                 init_kwargs["fork_from"] = fork_from
-                self._logger.info(f"Creating forked run '{run_name}' from parent {parent_run_id} at step {step_int}")
+                self._logger.info(
+                    f"Creating forked run '{run_name}' from parent {parent_run_id} at step {step_int}"
+                )
 
             # Initialize the run
             run = wandb.init(**init_kwargs)
@@ -362,7 +389,9 @@ class WandBLoader(DataLoader):
             # Note: We assume the run is already active from create_run
             # If not, we would need to resume it
             if self._active_run is None or self._active_run.id != run_id:
-                self._logger.error(f"Run {run_id} is not active. Call create_run first.")
+                self._logger.error(
+                    f"Run {run_id} is not active. Call create_run first."
+                )
                 raise RuntimeError(f"Run {run_id} is not active")
 
             for run_data_part in run_data:
@@ -371,6 +400,9 @@ class WandBLoader(DataLoader):
                 self.upload_parameters(run_df, run_id)
                 self.upload_metrics(run_df, run_id, step_multiplier)
                 self.upload_artifacts(run_df, run_id, files_directory, step_multiplier)
+
+            # Upload accumulated checkpoints/ONNX in correct sorted order
+            self._flush_checkpoint_artifacts()
 
             # Set tags accumulated from all data chunks
             if self._pending_tags:
@@ -381,17 +413,88 @@ class WandBLoader(DataLoader):
             self._active_run = None
             self._current_run_name = None
             self._pending_tags = set()
+            self._pending_checkpoints = []
+            self._pending_onnx = []
 
             self._logger.info(f"Successfully uploaded run {run_id} to W&B")
 
         except Exception:
             self._logger.error(f"Error uploading data for run {run_id}", exc_info=True)
             if self._active_run:
-                self._active_run.finish(exit_code=1)
-                self._active_run = None
-                self._current_run_name = None
+                try:
+                    self._active_run.finish(exit_code=1)
+                except Exception:
+                    self._logger.warning("Failed to finish run on error", exc_info=True)
+            self._active_run = None
+            self._current_run_name = None
             self._pending_tags = set()
+            self._pending_checkpoints = []
+            self._pending_onnx = []
             raise
+
+    def _flush_checkpoint_artifacts(self) -> None:
+        """Upload accumulated checkpoint and ONNX artifacts in globally sorted order.
+
+        Called after all parquet chunks have been processed, ensuring checkpoints
+        are uploaded in correct (epoch, step) order regardless of chunk boundaries.
+        """
+        if self._active_run is None:
+            return
+
+        # Sort all checkpoints globally by (epoch, step)
+        self._pending_checkpoints.sort(key=_ckpt_sort_key)
+
+        for cleaned_path, file_path in self._pending_checkpoints:
+            if not file_path.exists() or not file_path.is_file():
+                self._logger.warning(f"Checkpoint file not found: {file_path}")
+                continue
+
+            stem = Path(cleaned_path).name
+            epoch, step = _parse_checkpoint_stem(stem)
+            is_last = stem == "last"
+
+            artifact = wandb.Artifact(
+                name=f"checkpoints-{self._active_run.id}",
+                type="checkpoint",
+                metadata={
+                    "filename": stem,
+                    "epoch": epoch,
+                    "step": step,
+                    "is_last": is_last,
+                },
+            )
+            upload_name = f"{stem}.ckpt" if not Path(stem).suffix else stem
+            artifact.add_file(str(file_path), name=upload_name)
+
+            aliases = ["latest"]
+            if not is_last:
+                aliases.append(stem)
+            if is_last:
+                aliases.append("last")
+
+            self._active_run.log_artifact(artifact, aliases=aliases)
+
+        # Upload ONNX files without sorting (no epoch/step semantics)
+        for cleaned_path, file_path in self._pending_onnx:
+            if not file_path.exists() or not file_path.is_file():
+                self._logger.warning(f"ONNX file not found: {file_path}")
+                continue
+
+            stem = Path(cleaned_path).name
+            epoch, step = _parse_checkpoint_stem(stem)
+            artifact = wandb.Artifact(
+                name=f"onnx-{self._active_run.id}",
+                type="onnx",
+                metadata={"filename": stem, "epoch": epoch, "step": step},
+            )
+            upload_name = f"{stem}.onnx" if not Path(stem).suffix else stem
+            artifact.add_file(str(file_path), name=upload_name)
+
+            aliases = ["latest", stem]
+            self._active_run.log_artifact(artifact, aliases=aliases)
+
+        self._pending_checkpoints = []
+        self._pending_onnx = []
 
     def _upload_best_model_metadata(self, param_data: pd.DataFrame) -> set[str]:
         """Extract best model metadata from params and write to run.summary.
@@ -441,11 +544,17 @@ class WandBLoader(DataLoader):
         stem = Path(best_path_value).stem
 
         # Sanitize monitor for use as key suffix (replace / with _)
-        monitor_sanitized = monitor_value.replace("/", "_") if monitor_value else "unknown"
+        monitor_sanitized = (
+            monitor_value.replace("/", "_") if monitor_value else "unknown"
+        )
 
-        self._active_run.summary[f"metadata/checkpoint/best_model_name_{monitor_sanitized}"] = stem
+        self._active_run.summary[
+            f"metadata/checkpoint/best_model_name_{monitor_sanitized}"
+        ] = stem
         if best_score_value is not None:
-            self._active_run.summary[f"metadata/checkpoint/best_model_score_{monitor_sanitized}"] = best_score_value
+            self._active_run.summary[
+                f"metadata/checkpoint/best_model_score_{monitor_sanitized}"
+            ] = best_score_value
 
         self._logger.info(
             f"Set best model metadata: monitor={monitor_sanitized}, name={stem}, score={best_score_value}"
@@ -517,7 +626,9 @@ class WandBLoader(DataLoader):
         if param_count:
             self._logger.info(f"Uploaded {param_count} parameters for run {run_id}")
 
-    def upload_metrics(self, run_data: pd.DataFrame, run_id: TargetRunId, step_multiplier: int) -> None:
+    def upload_metrics(
+        self, run_data: pd.DataFrame, run_id: TargetRunId, step_multiplier: int
+    ) -> None:
         """Upload metrics (float series) to W&B run.
 
         Args:
@@ -567,10 +678,10 @@ class WandBLoader(DataLoader):
         run_name = self._current_run_name or run_id
 
         # Handle regular files — separate checkpoints and ONNX from other files
-        file_data = run_data[run_data["attribute_type"].isin(["file", "file_set", "artifact"])]
+        file_data = run_data[
+            run_data["attribute_type"].isin(["file", "file_set", "artifact"])
+        ]
 
-        checkpoint_rows: list[tuple[str, Path, pd.Series]] = []
-        onnx_rows: list[tuple[str, Path, pd.Series]] = []
         other_rows: list[tuple[str, Path, pd.Series]] = []
 
         for _, row in file_data.iterrows():
@@ -578,66 +689,11 @@ class WandBLoader(DataLoader):
                 file_path = files_base_path / row["file_value"]["path"]
                 cleaned_path = self._clean_attribute_path(row["attribute_path"])
                 if _is_checkpoint_path(cleaned_path):
-                    checkpoint_rows.append((cleaned_path, file_path, row))
+                    self._pending_checkpoints.append((cleaned_path, file_path))
                 elif _is_onnx_path(cleaned_path):
-                    onnx_rows.append((cleaned_path, file_path, row))
+                    self._pending_onnx.append((cleaned_path, file_path))
                 else:
                     other_rows.append((cleaned_path, file_path, row))
-
-        # Upload checkpoints as versioned W&B artifacts matching Sunstone conventions
-        def _ckpt_sort_key(item: tuple[str, Path, pd.Series]) -> tuple[float, float]:
-            cleaned_path, _file_path, _row = item
-            stem = Path(cleaned_path).name
-            if stem == "last":
-                return (float("inf"), float("inf"))
-            epoch, step = _parse_checkpoint_stem(stem)
-            return (epoch if epoch is not None else 0, step if step is not None else 0)
-
-        checkpoint_rows.sort(key=_ckpt_sort_key)
-
-        for cleaned_path, file_path, row in checkpoint_rows:
-            if not file_path.exists() or not file_path.is_file():
-                self._logger.warning(f"Checkpoint file not found: {file_path}")
-                continue
-
-            stem = Path(cleaned_path).name
-            epoch, step = _parse_checkpoint_stem(stem)
-            is_last = stem == "last"
-
-            artifact = wandb.Artifact(
-                name=f"checkpoints-{self._active_run.id}",
-                type="checkpoint",
-                metadata={"filename": stem, "epoch": epoch, "step": step, "is_last": is_last},
-            )
-            # Add .ckpt extension if file has none (Neptune strips extensions)
-            upload_name = f"{stem}.ckpt" if not Path(stem).suffix else stem
-            artifact.add_file(str(file_path), name=upload_name)
-
-            aliases = ["latest"]
-            if not is_last:
-                aliases.append(stem)
-            if is_last:
-                aliases.append("last")
-
-            self._active_run.log_artifact(artifact, aliases=aliases)
-
-        # Upload ONNX files as versioned W&B artifacts
-        for cleaned_path, file_path, row in onnx_rows:
-            if not file_path.exists() or not file_path.is_file():
-                self._logger.warning(f"ONNX file not found: {file_path}")
-                continue
-
-            stem = Path(cleaned_path).name
-            artifact = wandb.Artifact(
-                name=f"onnx-{self._active_run.id}",
-                type="onnx",
-                metadata={"filename": stem},
-            )
-            upload_name = f"{stem}.onnx" if not Path(stem).suffix else stem
-            artifact.add_file(str(file_path), name=upload_name)
-
-            aliases = ["latest", stem]
-            self._active_run.log_artifact(artifact, aliases=aliases)
 
         # Handle remaining files — log images/HTML as native W&B media, others as artifacts
         for cleaned_path, file_path, row in other_rows:
@@ -650,7 +706,9 @@ class WandBLoader(DataLoader):
                     self._active_run.log({attr_name: wandb.Html(str(file_path))})
                 else:
                     artifact_name = self._make_artifact_name(cleaned_path, run_name)
-                    artifact = wandb.Artifact(name=artifact_name, type=row["attribute_type"])
+                    artifact = wandb.Artifact(
+                        name=artifact_name, type=row["attribute_type"]
+                    )
                     if file_path.is_file():
                         artifact.add_file(str(file_path))
                     else:
@@ -663,14 +721,18 @@ class WandBLoader(DataLoader):
         # Media uses define_metric with a custom step axis per series so it doesn't
         # conflict with the global step used by float_series metrics.
         file_series_data = run_data[run_data["attribute_type"] == "file_series"].copy()
-        file_series_data["attribute_path"] = file_series_data["attribute_path"].apply(self._clean_attribute_path)
+        file_series_data["attribute_path"] = file_series_data["attribute_path"].apply(
+            self._clean_attribute_path
+        )
         for attr_path, group in file_series_data.groupby("attribute_path"):
             attr_name = self._sanitize_attribute_name(attr_path)
 
             # Detect if this series contains media files (check first valid file)
             is_media_series = False
             for _, probe_row in group.iterrows():
-                if pd.notna(probe_row["file_value"]) and isinstance(probe_row["file_value"], dict):
+                if pd.notna(probe_row["file_value"]) and isinstance(
+                    probe_row["file_value"], dict
+                ):
                     probe_path = files_base_path / probe_row["file_value"]["path"]
                     if probe_path.exists() and probe_path.is_file():
                         is_media_series = _is_image(probe_path) or _is_html(probe_path)
@@ -685,16 +747,28 @@ class WandBLoader(DataLoader):
                 if pd.notna(row["file_value"]) and isinstance(row["file_value"], dict):
                     file_path = files_base_path / row["file_value"]["path"]
                     if file_path.exists():
-                        step = self._convert_step_to_int(row["step"], step_multiplier) if pd.notna(row["step"]) else 0
+                        step = (
+                            self._convert_step_to_int(row["step"], step_multiplier)
+                            if pd.notna(row["step"])
+                            else 0
+                        )
 
                         if file_path.is_file() and _is_image(file_path):
-                            self._active_run.log({step_key: step, attr_name: wandb.Image(str(file_path))})
+                            self._active_run.log(
+                                {step_key: step, attr_name: wandb.Image(str(file_path))}
+                            )
                         elif file_path.is_file() and _is_html(file_path):
-                            self._active_run.log({step_key: step, attr_name: wandb.Html(str(file_path))})
+                            self._active_run.log(
+                                {step_key: step, attr_name: wandb.Html(str(file_path))}
+                            )
                         else:
                             # Fall back to artifact for non-media files
-                            artifact_name = self._make_artifact_name(attr_path, run_name, suffix=f"step_{step}")
-                            artifact = wandb.Artifact(name=artifact_name, type="file_series")
+                            artifact_name = self._make_artifact_name(
+                                attr_path, run_name, suffix=f"step_{step}"
+                            )
+                            artifact = wandb.Artifact(
+                                name=artifact_name, type="file_series"
+                            )
                             if file_path.is_file():
                                 artifact.add_file(str(file_path))
                             else:
@@ -704,20 +778,34 @@ class WandBLoader(DataLoader):
                         self._logger.warning(f"File not found: {file_path}")
 
         # Handle string series as text artifacts
-        string_series_data = run_data[run_data["attribute_type"] == "string_series"].copy()
-        string_series_data["attribute_path"] = string_series_data["attribute_path"].apply(self._clean_attribute_path)
+        string_series_data = run_data[
+            run_data["attribute_type"] == "string_series"
+        ].copy()
+        string_series_data["attribute_path"] = string_series_data[
+            "attribute_path"
+        ].apply(self._clean_attribute_path)
         for attr_path, group in string_series_data.groupby("attribute_path"):
             artifact_name = self._make_artifact_name(attr_path, run_name)
 
             # Create temporary file with text content
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", encoding="utf-8") as tmp_file:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", encoding="utf-8"
+            ) as tmp_file:
                 for _, row in group.iterrows():
                     if pd.notna(row["string_value"]):
                         series_step = (
-                            self._convert_step_to_int(row["step"], step_multiplier) if pd.notna(row["step"]) else None
+                            self._convert_step_to_int(row["step"], step_multiplier)
+                            if pd.notna(row["step"])
+                            else None
                         )
-                        timestamp = row["timestamp"].isoformat() if pd.notna(row["timestamp"]) else None
-                        text_line = f"{series_step}; {timestamp}; {row['string_value']}\n"
+                        timestamp = (
+                            row["timestamp"].isoformat()
+                            if pd.notna(row["timestamp"])
+                            else None
+                        )
+                        text_line = (
+                            f"{series_step}; {timestamp}; {row['string_value']}\n"
+                        )
                         tmp_file.write(text_line)
                 tmp_file_path = tmp_file.name
 
@@ -727,23 +815,33 @@ class WandBLoader(DataLoader):
                 self._active_run.log_artifact(artifact)
 
         # Handle histogram series as W&B Histograms
-        histogram_series_data = run_data[run_data["attribute_type"] == "histogram_series"].copy()
-        histogram_series_data["attribute_path"] = histogram_series_data["attribute_path"].apply(
-            self._clean_attribute_path
-        )
+        histogram_series_data = run_data[
+            run_data["attribute_type"] == "histogram_series"
+        ].copy()
+        histogram_series_data["attribute_path"] = histogram_series_data[
+            "attribute_path"
+        ].apply(self._clean_attribute_path)
         for attr_path, group in histogram_series_data.groupby("attribute_path"):
             attr_name = self._sanitize_attribute_name(attr_path)
 
             for _, row in group.iterrows():
-                if pd.notna(row["histogram_value"]) and isinstance(row["histogram_value"], dict):
-                    step = self._convert_step_to_int(row["step"], step_multiplier) if pd.notna(row["step"]) else 0
+                if pd.notna(row["histogram_value"]) and isinstance(
+                    row["histogram_value"], dict
+                ):
+                    step = (
+                        self._convert_step_to_int(row["step"], step_multiplier)
+                        if pd.notna(row["step"])
+                        else 0
+                    )
                     hist = row["histogram_value"]
 
                     # Convert Neptune histogram to W&B Histogram
                     # Neptune format: {"type": str, "edges": list, "values": list}
                     # W&B expects histogram data as np_histogram tuple or sequence
                     try:
-                        wandb_hist = wandb.Histogram(np_histogram=(hist.get("values", []), hist.get("edges", [])))
+                        wandb_hist = wandb.Histogram(
+                            np_histogram=(hist.get("values", []), hist.get("edges", []))
+                        )
                         self._active_run.log({attr_name: wandb_hist}, step=step)
                     except Exception:
                         self._logger.error(
