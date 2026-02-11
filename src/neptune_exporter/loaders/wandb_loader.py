@@ -309,6 +309,18 @@ class WandBLoader(DataLoader):
 
             # Get the first matching run
             for run in runs:
+                if run.state in ("crashed", "running"):
+                    self._logger.warning(
+                        f"Found incomplete run '{run_name}' (state={run.state}, id={run.id}). Deleting for re-import."
+                    )
+                    try:
+                        run.delete()
+                    except Exception:
+                        self._logger.error(
+                            f"Failed to delete incomplete run {run.id}",
+                            exc_info=True,
+                        )
+                    return None
                 return TargetRunId(run.id)
 
             return None

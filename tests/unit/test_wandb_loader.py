@@ -990,3 +990,60 @@ def test_state_cleanup_when_finish_throws():
         assert loader._pending_tags == set()
         assert loader._active_run is None
         assert loader._current_run_name is None
+
+
+@patch("wandb.Api")
+def test_find_run_deletes_crashed_run(mock_api_class):
+    """Test that find_run deletes crashed/running runs to allow re-import."""
+    loader = WandBLoader(entity="test-entity")
+
+    mock_api = Mock()
+    mock_api_class.return_value = mock_api
+
+    mock_run = Mock()
+    mock_run.id = "crashed-run-id"
+    mock_run.state = "crashed"
+    mock_api.runs.return_value = [mock_run]
+
+    result = loader.find_run("veo-ai/test-project", "TEST-RUN", None)
+
+    mock_run.delete.assert_called_once()
+    assert result is None
+
+
+@patch("wandb.Api")
+def test_find_run_deletes_running_run(mock_api_class):
+    """Test that find_run deletes running (incomplete) runs to allow re-import."""
+    loader = WandBLoader(entity="test-entity")
+
+    mock_api = Mock()
+    mock_api_class.return_value = mock_api
+
+    mock_run = Mock()
+    mock_run.id = "running-run-id"
+    mock_run.state = "running"
+    mock_api.runs.return_value = [mock_run]
+
+    result = loader.find_run("veo-ai/test-project", "TEST-RUN", None)
+
+    mock_run.delete.assert_called_once()
+    assert result is None
+
+
+@patch("wandb.Api")
+def test_find_run_keeps_finished_run(mock_api_class):
+    """Test that find_run returns finished runs (skip re-import)."""
+    loader = WandBLoader(entity="test-entity")
+
+    mock_api = Mock()
+    mock_api_class.return_value = mock_api
+
+    mock_run = Mock()
+    mock_run.id = "finished-run-id"
+    mock_run.state = "finished"
+    mock_api.runs.return_value = [mock_run]
+
+    result = loader.find_run("veo-ai/test-project", "TEST-RUN", None)
+
+    mock_run.delete.assert_not_called()
+    assert result == "finished-run-id"
