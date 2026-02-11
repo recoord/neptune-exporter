@@ -618,7 +618,7 @@ class WandBLoader(DataLoader):
                 config_flat[attr_name] = value
 
         if config_nested:
-            self._active_run.config.update(config_nested)
+            self._active_run.config["config"] = config_nested
         if neptune_meta:
             self._active_run.config.update(neptune_meta)
         if config_flat:

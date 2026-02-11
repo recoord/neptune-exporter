@@ -175,6 +175,42 @@ def test_upload_parameters():
     assert config_dict["test/param3"] == 42
 
 
+def test_upload_parameters_config_namespaced():
+    """Test that config/ params are namespaced under 'config' key in W&B config."""
+    loader = WandBLoader(entity="test-entity")
+
+    mock_run = Mock()
+    mock_run.config = {}
+    mock_run.summary = {}
+    loader._active_run = mock_run
+
+    test_data = pd.DataFrame(
+        {
+            "attribute_path": [
+                "config/model/learning_rate",
+                "config/model/batch_size",
+                "config/data/augmentation",
+            ],
+            "attribute_type": ["float", "int", "string"],
+            "string_value": [None, None, "flip"],
+            "float_value": [0.001, None, None],
+            "int_value": [None, 32, None],
+            "bool_value": [None, None, None],
+            "datetime_value": [None, None, None],
+            "string_set_value": [None, None, None],
+        }
+    )
+
+    loader.upload_parameters(test_data, "RUN-123")
+
+    # Config should be namespaced under "config" key
+    assert "config" in mock_run.config
+    config = mock_run.config["config"]
+    assert config["model"]["learning_rate"] == 0.001
+    assert config["model"]["batch_size"] == 32
+    assert config["data"]["augmentation"] == "flip"
+
+
 def test_upload_parameters_string_set():
     """Test parameter upload with string_set type."""
     loader = WandBLoader(entity="test-entity")
