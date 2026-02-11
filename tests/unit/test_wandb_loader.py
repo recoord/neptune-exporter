@@ -54,10 +54,7 @@ def test_sanitize_attribute_name():
     assert loader._sanitize_attribute_name("normal_name") == "normal_name"
 
     # Test name with invalid characters (W&B preserves "/" for hierarchical grouping)
-    assert (
-        loader._sanitize_attribute_name("invalid@name#with$chars/slashes")
-        == "invalid_name_with_chars/slashes"
-    )
+    assert loader._sanitize_attribute_name("invalid@name#with$chars/slashes") == "invalid_name_with_chars/slashes"
 
     # Test name starting with number (must start with letter or underscore)
     assert loader._sanitize_attribute_name("123_metric").startswith("_")
@@ -130,9 +127,7 @@ def test_create_run_with_parent(mock_init):
     loader = WandBLoader(entity="test-entity")
 
     # Create child with parent
-    run_id = loader.create_run(
-        "test-project", "child-run", "experiment-id", "wandb-run-parent"
-    )
+    run_id = loader.create_run("test-project", "child-run", "experiment-id", "wandb-run-parent")
 
     assert run_id == "wandb-run-child"
 
@@ -269,9 +264,7 @@ def test_upload_artifacts_files():
         mock_artifact_class.return_value = mock_artifact
 
         files_base_path = Path("/test/files")
-        loader.upload_artifacts(
-            test_data, "RUN-123", files_base_path, step_multiplier=1
-        )
+        loader.upload_artifacts(test_data, "RUN-123", files_base_path, step_multiplier=1)
 
         # Verify artifacts were created and logged
         assert mock_artifact_class.call_count == 2
@@ -303,9 +296,7 @@ def test_upload_artifacts_file_series():
         mock_artifact_class.return_value = mock_artifact
 
         files_base_path = Path("/test/files")
-        loader.upload_artifacts(
-            test_data, "RUN-123", files_base_path, step_multiplier=1
-        )
+        loader.upload_artifacts(test_data, "RUN-123", files_base_path, step_multiplier=1)
 
         # Verify artifacts include step in name
         assert mock_artifact_class.call_count == 2
@@ -350,14 +341,10 @@ def test_upload_artifacts_string_series():
         mock_artifact_class.return_value = mock_artifact
 
         files_base_path = Path("/test/files")
-        loader.upload_artifacts(
-            test_data, "RUN-123", files_base_path, step_multiplier=1
-        )
+        loader.upload_artifacts(test_data, "RUN-123", files_base_path, step_multiplier=1)
 
         # Verify artifact was created and logged (name is scoped per-run)
-        mock_artifact_class.assert_called_once_with(
-            name="test__string_series-RUN-123", type="string_series"
-        )
+        mock_artifact_class.assert_called_once_with(name="test__string_series-RUN-123", type="string_series")
         mock_artifact.add_file.assert_called_once()
         mock_run.log_artifact.assert_called_once_with(mock_artifact)
 
@@ -383,9 +370,7 @@ def test_upload_artifacts_histogram_series():
             "attribute_type": ["histogram_series"],
             "step": [Decimal("1.0")],
             "timestamp": [pd.Timestamp("2023-01-01")],
-            "histogram_value": [
-                {"type": "histogram", "edges": [0.0, 1.0, 2.0], "values": [10, 20]}
-            ],
+            "histogram_value": [{"type": "histogram", "edges": [0.0, 1.0, 2.0], "values": [10, 20]}],
         }
     )
 
@@ -394,9 +379,7 @@ def test_upload_artifacts_histogram_series():
         mock_histogram_class.return_value = mock_histogram
 
         files_base_path = Path("/test/files")
-        loader.upload_artifacts(
-            test_data, "RUN-123", files_base_path, step_multiplier=1
-        )
+        loader.upload_artifacts(test_data, "RUN-123", files_base_path, step_multiplier=1)
 
         # Verify Histogram was created and logged
         mock_histogram_class.assert_called_once()
@@ -438,9 +421,7 @@ def test_upload_artifacts_file_set():
         mock_artifact_class.return_value = mock_artifact
 
         files_base_path = Path("/test/files")
-        loader.upload_artifacts(
-            test_data, "RUN-123", files_base_path, step_multiplier=1
-        )
+        loader.upload_artifacts(test_data, "RUN-123", files_base_path, step_multiplier=1)
 
         # Verify artifacts were created and logged
         assert mock_artifact_class.call_count == 2
@@ -483,9 +464,7 @@ def test_upload_artifacts_artifact_type():
         mock_artifact_class.return_value = mock_artifact
 
         files_base_path = Path("/test/files")
-        loader.upload_artifacts(
-            test_data, "RUN-123", files_base_path, step_multiplier=1
-        )
+        loader.upload_artifacts(test_data, "RUN-123", files_base_path, step_multiplier=1)
 
         # Verify artifacts were created and logged
         assert mock_artifact_class.call_count == 2
@@ -555,9 +534,7 @@ def test_upload_run_data():
             yield table
 
         # Upload run data with step_multiplier
-        loader.upload_run_data(
-            table_generator(), "test-run-id", Path("/test/files"), step_multiplier=100
-        )
+        loader.upload_run_data(table_generator(), "test-run-id", Path("/test/files"), step_multiplier=100)
 
         # Verify methods were called
         mock_run.config.update.assert_called_once()  # Parameters
@@ -575,6 +552,19 @@ def test_parse_checkpoint_stem():
     assert _parse_checkpoint_stem("model_step=002756") == (None, 2756)
     assert _parse_checkpoint_stem("epoch_00010-step_00001000") == (10, 1000)
     assert _parse_checkpoint_stem("last") == (None, None)
+
+
+def test_to_sunstone_checkpoint_name():
+    """Test conversion from Neptune checkpoint names to Sunstone format."""
+    from neptune_exporter.loaders.wandb_loader import _to_sunstone_checkpoint_name
+
+    assert _to_sunstone_checkpoint_name("epoch=0035") == "epoch_00035-step_00000000"
+    assert _to_sunstone_checkpoint_name("epoch=0000") == "epoch_00000-step_00000000"
+    assert _to_sunstone_checkpoint_name("epoch=16-step=34000") == "epoch_00016-step_00034000"
+    assert _to_sunstone_checkpoint_name("model_step=002756") == "epoch_00000-step_00002756"
+    assert _to_sunstone_checkpoint_name("epoch_00010-step_00001000") == "epoch_00010-step_00001000"
+    assert _to_sunstone_checkpoint_name("last") == "last"
+    assert _to_sunstone_checkpoint_name("some_random_name") == "some_random_name"
 
 
 def test_ckpt_sort_key():
@@ -634,9 +624,7 @@ def test_upload_best_model_metadata():
 
     handled = loader._upload_best_model_metadata(param_data)
     assert len(handled) == 3
-    assert (
-        mock_run.summary["metadata/checkpoint/best_model_name_val_loss"] == "epoch=0035"
-    )
+    assert mock_run.summary["metadata/checkpoint/best_model_name_val_loss"] == "epoch_00035-step_00000000"
     assert mock_run.summary["metadata/checkpoint/best_model_score_val_loss"] == 0.123
 
     # Test with no monitor (defaults to "unknown")
@@ -655,10 +643,7 @@ def test_upload_best_model_metadata():
     )
 
     handled = loader._upload_best_model_metadata(param_data_no_monitor)
-    assert (
-        mock_run.summary["metadata/checkpoint/best_model_name_unknown"]
-        == "model_step=002756"
-    )
+    assert mock_run.summary["metadata/checkpoint/best_model_name_unknown"] == "epoch_00000-step_00002756"
 
     # Test with no best_model_path (no-op)
     mock_run.summary = {}
@@ -748,9 +733,7 @@ def test_cross_chunk_checkpoint_accumulation():
         loader.create_run("test-project", "test-run", "test-experiment")
 
         # Upload with 2-chunk generator
-        loader.upload_run_data(
-            two_chunk_generator(), "test-run-id", Path("/test/files"), step_multiplier=1
-        )
+        loader.upload_run_data(two_chunk_generator(), "test-run-id", Path("/test/files"), step_multiplier=1)
 
         # Get all Artifact() calls
         artifact_calls = mock_artifact_class.call_args_list
@@ -761,17 +744,17 @@ def test_cross_chunk_checkpoint_accumulation():
         # First artifact should be epoch=5, second should be epoch=10
         first_metadata = artifact_calls[0][1]["metadata"]
         second_metadata = artifact_calls[1][1]["metadata"]
-        assert first_metadata["epoch"] == 5, (
-            f"Expected epoch=5 first, got {first_metadata}"
-        )
-        assert second_metadata["epoch"] == 10, (
-            f"Expected epoch=10 second, got {second_metadata}"
-        )
+        assert first_metadata["epoch"] == 5, f"Expected epoch=5 first, got {first_metadata}"
+        assert second_metadata["epoch"] == 10, f"Expected epoch=10 second, got {second_metadata}"
 
-        # Verify aliases: epoch-based checkpoints get ["latest", stem]
+        # Verify filenames are in Sunstone format
+        assert first_metadata["filename"] == "epoch_00005-step_00000000"
+        assert second_metadata["filename"] == "epoch_00010-step_00000000"
+
+        # Verify aliases: epoch-based checkpoints get ["latest", stem] in Sunstone format
         alias_calls = mock_run.log_artifact.call_args_list
-        assert alias_calls[0][1]["aliases"] == ["latest", "epoch=0005"]
-        assert alias_calls[1][1]["aliases"] == ["latest", "epoch=0010"]
+        assert alias_calls[0][1]["aliases"] == ["latest", "epoch_00005-step_00000000"]
+        assert alias_calls[1][1]["aliases"] == ["latest", "epoch_00010-step_00000000"]
 
 
 def test_cross_chunk_last_checkpoint_sorts_last():
@@ -841,9 +824,7 @@ def test_cross_chunk_last_checkpoint_sorts_last():
 
         loader.create_run("test-project", "test-run", "test-experiment")
 
-        loader.upload_run_data(
-            two_chunk_generator(), "test-run-id", Path("/test/files"), step_multiplier=1
-        )
+        loader.upload_run_data(two_chunk_generator(), "test-run-id", Path("/test/files"), step_multiplier=1)
 
         artifact_calls = mock_artifact_class.call_args_list
         assert len(artifact_calls) == 2
@@ -851,16 +832,15 @@ def test_cross_chunk_last_checkpoint_sorts_last():
         # epoch=5 should be first (version 1), "last" should be second (version 2)
         first_metadata = artifact_calls[0][1]["metadata"]
         second_metadata = artifact_calls[1][1]["metadata"]
-        assert first_metadata["epoch"] == 5, (
-            f"Expected epoch=5 first, got {first_metadata}"
-        )
-        assert second_metadata["is_last"] is True, (
-            f"Expected 'last' second, got {second_metadata}"
-        )
+        assert first_metadata["epoch"] == 5, f"Expected epoch=5 first, got {first_metadata}"
+        assert second_metadata["is_last"] is True, f"Expected 'last' second, got {second_metadata}"
 
-        # Verify aliases: epoch gets ["latest", stem], last gets ["latest", "last"]
+        # Verify filename is in Sunstone format
+        assert first_metadata["filename"] == "epoch_00005-step_00000000"
+
+        # Verify aliases: epoch gets ["latest", stem] in Sunstone format, last gets ["latest", "last"]
         alias_calls = mock_run.log_artifact.call_args_list
-        assert alias_calls[0][1]["aliases"] == ["latest", "epoch=0005"]
+        assert alias_calls[0][1]["aliases"] == ["latest", "epoch_00005-step_00000000"]
         assert alias_calls[1][1]["aliases"] == ["latest", "last"]
 
 
@@ -909,9 +889,7 @@ def test_state_cleanup_after_upload_failure():
         import pytest
 
         with pytest.raises(RuntimeError, match="Simulated chunk read failure"):
-            loader.upload_run_data(
-                failing_generator(), "test-run-id", Path("/test/files"), step_multiplier=1
-            )
+            loader.upload_run_data(failing_generator(), "test-run-id", Path("/test/files"), step_multiplier=1)
 
         # Verify all state is cleaned up
         assert loader._pending_checkpoints == []
@@ -968,9 +946,7 @@ def test_state_cleanup_when_finish_throws():
         import pytest
 
         with pytest.raises(RuntimeError, match="Simulated chunk read failure"):
-            loader.upload_run_data(
-                failing_generator(), "test-run-id", Path("/test/files"), step_multiplier=1
-            )
+            loader.upload_run_data(failing_generator(), "test-run-id", Path("/test/files"), step_multiplier=1)
 
         # State must still be cleaned up despite finish() throwing
         assert loader._pending_checkpoints == []
